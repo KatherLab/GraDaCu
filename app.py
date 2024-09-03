@@ -1,12 +1,12 @@
 import io
 from datetime import datetime
+from dateutil import parser
 
 from flask import Flask, render_template, request, jsonify, session, send_from_directory, redirect, url_for, flash, \
     send_file
 from werkzeug.utils import secure_filename
 from flask_wtf import FlaskForm
 from wtforms import FieldList, FormField, StringField
-from wtforms.validators import ValidationError
 import pandas as pd
 import re
 import os
@@ -44,7 +44,7 @@ def is_regex_options_pattern(s):
         return []
 
 
-def validate_field(value, rules, column_name: str = ''):
+def validate_field(value, rules, column_name: str = '', matched_column:bool=False):
     errors = []
     corrected_value = None
     column_name = column_name.strip()
@@ -52,9 +52,63 @@ def validate_field(value, rules, column_name: str = ''):
     if rules['requiredness'] == 'required' and (value is None or value == '' or value == 'N/A'):
         errors.append("This field is required")
     elif value and str(value) not in ['N/A', 'n/a', 'nan', '']:
+        if rules['class'] == 'date':
+            value = str(value).strip()
+            desired_date_format = rules['allowedvalues']
+
+            # First check if only year with the following pattern is provided: '"2024' (check via regex), then just use the year as corrected value
+            if re.match(r'^"\d{4}$', value):
+                corrected_value = value[1:]
+                return errors, corrected_value
+            # or if just the year is provided, just take the year
+            elif re.match(r'^´\d{4}$', value):
+
+                corrected_value = value[1:]  # Remove the leading ´ character
+                return errors, corrected_value
+
+            # Check if the input pattern is `´MM.YYYY`, convert to the desired date format
+            elif re.match(r'^´\d{2}\.\d{4}$', value):
+                try:
+                    # Extract month and year, parse it to a date object
+                    month, year = value[1:].split('.')  # Remove leading ´ and split by '.'
+                    date_obj = datetime.strptime(f"{year}-{month}-01", "%Y-%m-%d")
+
+                    # Check if the date format is a valid strftime format
+                    try:
+                        corrected_value = date_obj.strftime(desired_date_format)
+                    except ValueError as e:
+                        errors.append(f"Invalid desired date format '{desired_date_format}': {e}")
+                        return errors, value
+
+                    # Debug: Print the corrected value
+                    return errors, corrected_value
+
+                except ValueError as e:
+                    errors.append(f"Error parsing date: {e}")
+                    return errors, value  # Return the original value if parsing fails
+
+                # Or if just the year is provided, just take the year
+            elif re.match(r'^\d{4}$', value):
+                corrected_value = value
+                return errors, corrected_value
+
+            try:
+                date_obj = parser.parse(value)
+
+                # Format the datetime object to the desired format
+                corrected_value = date_obj.strftime(desired_date_format)
+            except ValueError:
+                errors.append("Invalid date format")
+
+            return errors, corrected_value
+
         if rules['class'] == 'character' and not isinstance(value, str):
             if str(value) in ['nan', 'NaN']:
-                corrected_value = 'N/A'
+                if matched_column:
+                    corrected_value = 'N/A'
+                else:
+                    corrected_value = ''
+                    errors.append("Missing Value")
             else:
                 corrected_value = str(value)
                 errors.append("Value should be a string")
@@ -122,7 +176,13 @@ def validate_field(value, rules, column_name: str = ''):
 
     else:
         print("Correcting value to N/A")
-        corrected_value = 'N/A'
+        if matched_column:
+            corrected_value = 'N/A'
+        else:
+            corrected_value = ''
+            if rules['requiredness'] == 'required':
+                errors.append("Missing Value")
+            # errors.append("Missing Value")
 
     return errors, corrected_value
 
@@ -149,11 +209,14 @@ def load_grammar(file):
     if file.filename.endswith('.xlsx'):
         grammar_df = pd.read_excel(file)
     elif file.filename.endswith('.csv'):
-        grammar_df = pd.read_csv(file)
+        grammar_df = pd.read_csv(file, delimiter=',')
     else:
         raise ValueError('Unsupported file format')
     grammar = {}
     for _, row in grammar_df.iterrows():
+        if not str(row['col.name']):
+            print("Skipping empty grammar row")
+            continue
         grammar[row['col.name']] = {
             'class': row['col.class'],
             'uniqueness': row['uniqueness'],
@@ -165,7 +228,7 @@ def load_grammar(file):
 
 
 def normalize_column_name(name):
-    return re.sub(r'[_\s]', '', name.lower())
+    return re.sub(r'[_\s]', '', str(name).lower())
 
 
 def match_columns(grammar, data_columns):
@@ -219,7 +282,7 @@ def validate():
             for j, col in enumerate(all_columns):
                 value = form.values[i + j].data
                 if col in grammar:
-                    error, corrected = validate_field(value, grammar[col], column_name=col)
+                    error, corrected = validate_field(value, grammar[col], column_name=col, matched_column=col in matched)
                     row[col] = corrected if corrected is not None else value
                     row_errors.append(', '.join(error) if error else '')
                     row_corrected.append(corrected)
@@ -245,7 +308,7 @@ def validate():
                                    errors=errors, corrected_values=corrected_values, num_errors=num_errors)
         elif 'download' in request.form:
             # Save updated data
-             # .to_csv(filepath, index=False)
+            # .to_csv(filepath, index=False)
 
             buffer = io.BytesIO()
 
@@ -278,8 +341,8 @@ def validate():
             for _, row in data.iterrows():
                 for col in all_columns:
                     if col in grammar:
-                        value = row.get(matched.get(col), 'N/A')
-                        error, corrected = validate_field(value, grammar[col], column_name=col)
+                        value = row.get(matched.get(col), '')
+                        error, corrected = validate_field(value, grammar[col], column_name=col, matched_column=col in matched)
                         form.values.append_entry(corrected if corrected is not None else value)
                         errors.append(', '.join(error) if error else '')
                         corrected_values.append(corrected)
@@ -292,6 +355,7 @@ def validate():
 
         return render_template('validate.html', form=form, columns=all_columns, grammar_columns=grammar_columns,
                                errors=errors, corrected_values=corrected_values, num_errors=num_errors)
+
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -352,4 +416,4 @@ def uploaded_file(filename):
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0")
